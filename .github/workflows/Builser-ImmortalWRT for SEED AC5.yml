@@ -1,0 +1,303 @@
+name: Builser-ImmortalWRT for SEED AC5
+
+on:
+  workflow_dispatch:    # 手动触发
+  push:
+    branches: [master]
+    paths:
+      - '.config'
+      - 'feeds.conf.default'
+      - '.github/workflows/build.yml'
+      - 'files/**'
+
+  schedule:
+    - cron: '0 0 * * *'  # 每天 UTC 0 点检查上游更新(北京时间 8:00)
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/BeeconMini/immortalwrt.git
+  REPO_BRANCH: 24.10.1
+  TARGET: mediatek/filogic
+  DEVICE: beeconmini_seed-ac5
+  # ccache(编译缓存): 显著缩短二次编译时间(官方 CI 与社区模板均采用)
+  CCACHE_DIR: ${{ github.workspace }}/source/.ccache
+  CCACHE_MAXSIZE: 2G
+  CCACHE_COMPRESS: "true"
+  CCACHE_COMPILERCHECK: content
+
+jobs:
+  build:
+    # 2026-09-11: 改用 ubuntu-24.04 —— Codespace(studious-carnival, Ubuntu 24.04.4 / glibc 2.38 / gcc 13)
+    # 预热的 staging_dir/host 工具链是在 24.04 上编译的, 在 22.04(glibc 2.35) 上会全部报
+    # "sed/find/xargs: version `GLIBC_2.38' not found" → 连 make defconfig 都跑不通(包数=0)。
+    # 切到 24.04 让 glibc/gcc 与预热缓存一致, ccache 才可能命中。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout config
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update -qq
+          sudo apt install -y -qq build-essential ccache clang cmake curl \
+            ecj fastjar file g++ gawk gettext git \
+            libelf-dev libncurses-dev libssl-dev \
+            python3 python3-docutils python3-setuptools rsync swig time \
+            unzip wget zlib1g-dev qemu-utils zstd
+          # 24.04 上 libncurses5-dev/libncursesw5-dev 已移除, 装不上不影响构建
+          sudo apt install -y -qq libncurses5-dev libncursesw5-dev 2>/dev/null || true
+          echo "runner arch: $(uname -m), nproc: $(nproc), mem: $(free -h | awk '/Mem/{print $2}')"
+          ccache --version | head -1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache
+          df -h /
+
+      - name: Clone source
+        run: |
+          git clone -b $REPO_BRANCH --single-branch $REPO_URL source
+          cd source
+          cp $GITHUB_WORKSPACE/feeds.conf.default feeds.conf.default
+          cp $GITHUB_WORKSPACE/.config .config
+          [ -d $GITHUB_WORKSPACE/files ] && cp -r $GITHUB_WORKSPACE/files ./
+          mkdir -p .ccache
+          echo "=== 下载目录/缓存 ==="
+          df -h .
+
+      # ---- 多层缓存(社区验证做法: linkease/openwrt-app-actions、OpenWrt Fastbuild、openwrt 官方 CI) ----
+      - name: Restore dl cache
+        uses: actions/cache@v4
+        with:
+          path: source/dl
+          key: u2404-dl-${{ hashFiles('feeds.conf.default') }}-${{ github.run_number }}
+          restore-keys: |
+            u2404-dl-${{ hashFiles('feeds.conf.default') }}-
+            u2404-dl-
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: source/.ccache
+          key: u2404-ccache-${{ hashFiles('.config', 'feeds.conf.default') }}-${{ github.run_number }}
+          restore-keys: |
+            u2404-ccache-${{ hashFiles('.config', 'feeds.conf.default') }}-
+            u2404-ccache-
+
+      - name: Restore staging_dir
+        uses: actions/cache@v4
+        with:
+          path: source/staging_dir
+          key: u2404-staging-${{ hashFiles('.config', 'feeds.conf.default') }}-${{ github.run_number }}
+          restore-keys: |
+            u2404-staging-${{ hashFiles('.config', 'feeds.conf.default') }}-
+            u2404-staging-
+
+      # ---- 从 Release 资产恢复 Codespace 预热缓存(优先于 actions/cache, 解包后覆盖) ----
+      # 预热脚本: scripts/codespace-prepare-cache.sh (在 Codespace 里跑一次即可)
+      - name: Restore prebuilt caches (Codespace 预热资产)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd source
+          rm -rf /tmp/pc && mkdir -p /tmp/pc
+          gh release download prebuilt-cache --repo ${{ github.repository }} \
+            --pattern 'prebuilt-cache.tar.zst.part-*' --dir /tmp/pc --clobber 2>/dev/null || true
+          if ls /tmp/pc/prebuilt-cache.tar.zst.part-* >/dev/null 2>&1; then
+            echo "发现预热缓存资产, 解包到 source/ ..."
+            # 已在 source/ 内(cd source), 因此这里必须解到当前目录 "."
+            # 历史 bug: 写成 `-C source` → 相当于 source/source 不存在 → tar 报错 exit 2
+            cat /tmp/pc/prebuilt-cache.tar.zst.part-* | zstd -d | tar -xf - -C .
+            echo "=== 恢复后大小 ==="
+            du -sh .ccache dl staging_dir 2>/dev/null || true
+            ls -d build_dir 2>/dev/null && du -sh build_dir || true
+            AVAIL=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+            echo "恢复后可用磁盘: ${AVAIL}GB"
+            if [ "${AVAIL:-0}" -lt 8 ]; then
+              echo "::warning::磁盘偏紧, 删除 dl 目录腾出空间(编译时会按需重新下载)"
+              rm -rf dl
+            fi
+            # 缓存有效性校验: ccache 或 staging_dir 至少有一个非空, 否则视为无效缓存(避免白跑 6 小时冷构建)
+            if [ ! -d .ccache ] && [ ! -d staging_dir ]; then
+              echo "::error::预热缓存解包后 .ccache 与 staging_dir 均不存在, 缓存无效"
+              exit 1
+            fi
+            echo "PREBUILT_CACHE=yes" >> "$GITHUB_ENV"
+          else
+            echo "没有预热缓存资产(prebuilt-cache Release), 本次按冷构建执行"
+            echo "PREBUILT_CACHE=no" >> "$GITHUB_ENV"
+          fi
+
+      - name: Update feeds & apply fixes
+        run: |
+          cd source
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          # 修复 libffi feed: 上游 InstallDev 复制 fficonfig.h 的 $(GNU_TARGET_NAME)* glob
+          # 在 3.4.7 布局下匹配不到(历史编译失败原因之一)。直接改 feed 的 Makefile, 用 find 兜底。
+          # 注意: 不可做成 feeds/.../libffi/patches/*.patch(会把补丁打进 libffi 源码树导致失败)
+          python3 $GITHUB_WORKSPACE/scripts/fix-libffi-makefile.py feeds/packages/libs/libffi/Makefile
+          # 启用 ccache
+          if grep -qE '^CONFIG_CCACHE=' .config; then
+            sed -i 's|^CONFIG_CCACHE=.*|CONFIG_CCACHE=y|' .config
+          else
+            echo 'CONFIG_CCACHE=y' >> .config
+          fi
+          # 配置收敛: 历史 .config 单次 defconfig 会静默丢弃大部分已选包(固件缩水到28MB),
+          # 反复"从原始 .config 补回缺失的 =y 并 defconfig"直至稳定, 得到规范化配置。
+          PREV=-1
+          for i in 1 2 3 4 5 6 7 8; do
+            grep -hE '^CONFIG_PACKAGE_[^ =]+=y' $GITHUB_WORKSPACE/.config | while IFS= read -r line; do
+              sym="${line%%=*}"
+              if ! grep -qE "^${sym}=y$|^${sym}=m$" .config; then
+                echo "$line" >> .config
+              fi
+            done
+            make defconfig >/dev/null 2>&1
+            N=$(grep -cE '^CONFIG_PACKAGE_[a-z0-9._-]+=y' .config || true)
+            echo "第 $i 轮后 PACKAGE=y: $N"
+            if [ "$N" -eq "$PREV" ]; then echo "配置已收敛"; break; fi
+            PREV=$N
+          done
+          # defconfig 后再次确保 ccache 开启(防止被冲掉)
+          grep -qE '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
+          grep -E '^CONFIG_CCACHE=' .config
+
+      - name: Validate config (防配置丢失回归)
+        run: |
+          cd source
+          PKGS=$(grep -cE '^CONFIG_PACKAGE_[a-z0-9._-]+=y' .config || true)
+          LUCI=$(grep -cE '^CONFIG_PACKAGE_luci-app-[a-z0-9-]+=y' .config || true)
+          echo "收敛后有效包数: $PKGS, luci-app 数: $LUCI"
+          if [ "$PKGS" -lt 430 ]; then
+            echo "::error::defconfig 后包数异常($PKGS < 430), 疑似配置被静默丢弃, 终止构建"
+            exit 1
+          fi
+          if [ "$LUCI" -lt 20 ]; then
+            echo "::error::defconfig 后 luci-app 数异常($LUCI < 20), 终止构建"
+            exit 1
+          fi
+          for p in luci-app-dockerman luci-app-mwan3 nikki mwan3 dockerd; do
+            if ! grep -qE "^CONFIG_PACKAGE_$p=y" .config; then
+              echo "::error::关键包 $p 未保留!"
+              exit 1
+            fi
+          done
+          # 防回归: 确认会触发 Rust 工具链的孤儿包确实已关闭
+          for p in shadowsocks-rust-sslocal shadowsocks-rust-ssserver shadow-tls dns2socks-rust; do
+            if grep -qE "^CONFIG_PACKAGE_$p=y" .config; then
+              echo "::error::$p 仍被选中, 会编译 Rust 工具链(1.5~2h)导致超时"
+              exit 1
+            fi
+          done
+          echo "关键包全部保留 ✓"
+
+      - name: Download source packages
+        run: |
+          cd source
+          for i in 1 2 3; do
+            echo "--- make download 第 $i 次 ---"
+            if make -j$(($(nproc)+1)) download; then
+              echo "源码包全部下载成功"
+              break
+            fi
+            echo "download 存在失败项, 30秒后重试..."
+            sleep 30
+          done
+          make download 2>&1 | grep -iE "failed|error" && exit 1 || true
+        timeout-minutes: 60
+
+      - name: Build firmware
+        run: |
+          cd source
+          make -j$(nproc) V=s
+          echo "=== ccache 统计 ==="
+          ccache -s || true
+        # 单 job 硬上限 360min, 留 ~35min 给下面"失败也存热缓存"的步骤
+        timeout-minutes: 320
+
+      # ---- 失败/超时也保存热缓存(自我累积) ----
+      # 目的: 冷构建在 4 核 runner 上 >6h 必然超时。让每次失败都留下
+      # staging_dir/.ccache/dl 的完整快照, 下次运行从"上次跑到哪"继续, 逐轮收敛到构建成功。
+      - name: Save warm cache (失败/超时也保存, 供下次续跑)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd source
+          if ls bin/targets/mediatek/filogic/*squashfs-sysupgrade.bin >/dev/null 2>&1; then
+            echo "已有固件产物, 跳过缓存上传"
+            exit 0
+          fi
+          PACK=""
+          for d in .ccache dl staging_dir; do
+            if [ -d "$d" ]; then PACK="$PACK $d"; fi
+          done
+          if [ -z "$PACK" ]; then echo "无可打包目录, 跳过"; exit 0; fi
+          echo "打包: $PACK"
+          du -sh $PACK || true
+          rm -f /tmp/warm.tar.zst /tmp/warm.part-* /tmp/prebuilt-cache.tar.zst.part-*
+          tar -I 'zstd -T0 -3' -cf /tmp/warm.tar.zst $PACK
+          ls -l --block-size=M /tmp/warm.tar.zst
+          split -b 1900M -d -a 3 /tmp/warm.tar.zst /tmp/warm.part-
+          i=0
+          for f in /tmp/warm.part-*; do
+            mv "$f" "/tmp/prebuilt-cache.tar.zst.part-$(printf '%03d' $i)"
+            i=$((i+1))
+          done
+          ls -l /tmp/prebuilt-cache.tar.zst.part-* | head
+          gh release view prebuilt-cache --repo ${{ github.repository }} >/dev/null 2>&1 \
+            || gh release create prebuilt-cache --repo ${{ github.repository }} \
+                 --title "Prebuilt build cache" --notes "Actions/Codespace 预热缓存(自动滚动更新)"
+          # 必须清掉旧分片: 否则新包分片数变少时, 旧的 part-002 会被 cat 进来导致解包损坏
+          gh release view prebuilt-cache --repo ${{ github.repository }} --json assets \
+            -q '.assets[].name' 2>/dev/null | grep -E '^prebuilt-cache\.tar\.zst\.part-' | \
+            while IFS= read -r n; do
+              gh release delete-asset prebuilt-cache "$n" --repo ${{ github.repository }} -y || true
+            done || true
+          gh release upload prebuilt-cache --repo ${{ github.repository }} \
+            /tmp/prebuilt-cache.tar.zst.part-* --clobber
+          rm -f /tmp/warm.tar.zst /tmp/prebuilt-cache.tar.zst.part-*
+          echo "热缓存已上传, 可用磁盘:"
+          df -BG --output=avail . | tail -1
+
+      - name: Rename firmware (型号-版本命名)
+        run: |
+          cd source/bin/targets/mediatek/filogic
+          for f in immortalwrt-*-beeconmini_seed-ac5-*.bin; do
+            [ -e "$f" ] || continue
+            new=$(echo "$f" | sed -E "s/^immortalwrt-mediatek-filogic-beeconmini_seed-ac5/SEED-AC5-${REPO_BRANCH}/")
+            mv -v "$f" "$new"
+          done
+          echo "=== 重命名后产物 ==="
+          ls -la *.bin
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: seed-ac5-firmware
+          path: |
+            source/bin/targets/mediatek/filogic/*.bin
+            source/bin/targets/mediatek/filogic/*.buildinfo
+            source/bin/targets/mediatek/filogic/*.manifest
+          retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_id }}
+          name: Firmware build ${{ github.run_id }}
+          body: |
+            Automated build triggered by ${{ github.event_name }}.
+            - Commit: ${{ github.sha }}
+            - Date: ${{ github.event.head_commit.timestamp || github.event.client_payload.created_at || 'manual' }}
+          files: |
+            source/bin/targets/mediatek/filogic/*.bin
+            source/bin/targets/mediatek/filogic/*.buildinfo
+          generate_release_notes: true
+          make_latest: true
